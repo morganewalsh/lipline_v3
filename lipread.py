@@ -674,13 +674,79 @@ def pick_screen_region(monitor: int = 1, wait_s: int = 5) -> dict:
     return region
 
 
-def screen_region(args) -> dict | None:
-    """The region to read for --screen: the saved one, or ask for one."""
+_screen_detector = None
+
+
+def find_face_on_screen(monitor: int = 1) -> dict | None:
+    """Screenshot the monitor, find the largest face (e.g. the pinned speaker in Meet) and
+    return a square screen region around it, or None if no face is visible."""
+    global _screen_detector
+    if _screen_detector is None:
+        import mediapipe as mp
+        from mediapipe.tasks import python as mp_python
+        from mediapipe.tasks.python import vision
+        ensure_face_model()
+        options = vision.FaceLandmarkerOptions(
+            base_options=mp_python.BaseOptions(model_asset_path=str(FACE_MODEL_PATH)),
+            running_mode=vision.RunningMode.IMAGE, num_faces=4)
+        _screen_detector = (mp, vision.FaceLandmarker.create_from_options(options))
+    mp, detector = _screen_detector
+
+    with open_mss() as sct:
+        mon = sct.monitors[monitor]
+        shot = np.array(sct.grab(mon))[:, :, :3]
+    rgb = np.ascontiguousarray(cv2.cvtColor(np.ascontiguousarray(shot), cv2.COLOR_BGR2RGB))
+    H, W = rgb.shape[:2]
+    # The face finder works best when a face fills a fair part of the image, so search the
+    # whole screen and nine overlapping half-size windows.
+    cw, ch = W // 2, H // 2
+    crops = [(0, 0, W, H)] + [(gx * (W - cw) // 2, gy * (H - ch) // 2, cw, ch)
+                              for gy in range(3) for gx in range(3)]
+    best = None
+    for x0, y0, w, h in crops:
+        sub = np.ascontiguousarray(rgb[y0:y0 + h, x0:x0 + w])
+        result = detector.detect(mp.Image(image_format=mp.ImageFormat.SRGB, data=sub))
+        for face in result.face_landmarks:
+            xs = np.clip([p.x for p in face], 0, 1) * w + x0
+            ys = np.clip([p.y for p in face], 0, 1) * h + y0
+            box = (xs.min(), ys.min(), xs.max(), ys.max())
+            area = (box[2] - box[0]) * (box[3] - box[1])
+            if best is None or area > best[0]:
+                best = (area, box)
+    if best is None:
+        return None
+    x1, y1, x2, y2 = best[1]
+    side = min(max(x2 - x1, y2 - y1) * 1.9, W, H)          # face plus a margin, square
+    side = max(int(side) // 2 * 2, 64)
+    left = int(np.clip((x1 + x2) / 2 - side / 2, 0, W - side))
+    top = int(np.clip((y1 + y2) / 2 - side / 2, 0, H - side))
+    return {"left": mon["left"] + left, "top": mon["top"] + top, "width": side, "height": side}
+
+
+def wait_for_face_on_screen(monitor: int = 1, feed: "CaptionFeed | None" = None) -> dict:
+    """Keep looking until a face is visible on screen (Ctrl+C to give up)."""
+    warned = False
+    while True:
+        region = find_face_on_screen(monitor)
+        if region:
+            print(f"Reading the face on screen at x={region['left']}, y={region['top']}, "
+                  f"size {region['width']}px")
+            return region
+        if not warned:
+            print("No face visible on screen yet: bring the Meet window to the front and pin the speaker…")
+            warned = True
+        if feed:
+            feed.set_status("Looking for a face")
+        time.sleep(1)
+
+
+def screen_region(args, feed: "CaptionFeed | None" = None) -> dict | None:
+    """The region to read for --screen: found automatically, or chosen by hand with --pick-region."""
     if not getattr(args, "screen", False):
         return None
-    if REGION_FILE.exists() and not args.pick_region:
-        return json.loads(REGION_FILE.read_text())
-    return pick_screen_region(args.monitor)
+    if args.pick_region:
+        return pick_screen_region(args.monitor)
+    return wait_for_face_on_screen(args.monitor, feed)
 
 
 class FrameSource:
@@ -715,11 +781,16 @@ class FrameSource:
 # Step 5 · L1 live app: train and read in one window
 # =============================================================================
 def open_camera(index: int) -> cv2.VideoCapture:
-    cap = cv2.VideoCapture(index)
+    cap = cv2.VideoCapture(index, cv2.CAP_DSHOW) if os.name == "nt" else cv2.VideoCapture(index)
+    if os.name == "nt" and not cap.isOpened():               # DirectShow failed: try the default backend
+        cap = cv2.VideoCapture(index)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
     if not cap.isOpened():
-        sys.exit(f"Could not open camera {index}. Try --camera 1, or close other apps using it.")
+        sys.exit(f"Could not open camera {index}. Turn your camera off in Meet/Zoom (or close apps "
+                 f"using it), or try --camera 1.")
+    for _ in range(5):                                       # let exposure settle
+        cap.read()
     return cap
 
 
@@ -854,17 +925,20 @@ def draw_hud(frame, words, model, meter, calib, seg, armed, reading, transcript,
 # Step 6 · L2: record a clip and run the pretrained model
 # =============================================================================
 def record_clip(out: str, seconds: float, camera: int, fps: int = 25,
-                region: dict | None = None, feed: CaptionFeed | None = None) -> Path:
+                region: dict | None = None, feed: CaptionFeed | None = None,
+                source: "FrameSource | None" = None, countdown: float = 3) -> Path:
     """Record `seconds` of video (webcam, or a screen region) and save it at exactly `fps` fps.
     In screen mode there is no preview window, so nothing covers the video being read."""
-    source = FrameSource(camera, region, mirror=False)       # save the video unmirrored
+    own_source = source is None
+    if own_source:
+        source = FrameSource(camera, region, mirror=False)   # save the video unmirrored
     status = feed.set_status if feed else (lambda _s: None)
     try:
         t0 = time.monotonic()
-        while (left := 3 - (time.monotonic() - t0)) > 0:      # countdown
+        while (left := countdown - (time.monotonic() - t0)) > 0:   # countdown
             ok, frame = source.read()
             if not ok:
-                sys.exit("Video source stopped delivering frames.")
+                raise RuntimeError("The camera stopped delivering frames.")
             status(f"Recording in {int(left) + 1}…")
             if region is None:
                 view = cv2.flip(frame, 1)
@@ -887,10 +961,11 @@ def record_clip(out: str, seconds: float, camera: int, fps: int = 25,
                 cv2.imshow("lipread - record", view)
                 cv2.waitKey(1)
     finally:
-        source.release()
-        cv2.destroyAllWindows()
-    if not frames:
-        sys.exit("No frames recorded.")
+        if own_source:
+            source.release()
+        cv2.destroyAllWindows()                              # no frozen window while the model reads
+    if len(frames) < 25:
+        raise RuntimeError("Too few frames recorded; is the camera working?")
 
     # Webcams rarely deliver exactly 25 fps, so pick the nearest real frame for each 1/25 s.
     times = np.array(times)
@@ -1077,35 +1152,60 @@ class VSRModel:
 
 
 def run_transcribe(args) -> None:
-    region = screen_region(args) if args.record > 0 else None
     feed = CaptionFeed()
     if args.captions:
         start_caption_page(feed, args.port, not args.no_browser)
+    region = screen_region(args, feed) if args.record > 0 else None
+    follow_face = args.screen and not args.pick_region      # re-find the face before every clip
     feed.set_status("Loading model")
     model = VSRModel(args.repo, args.config, args.python, args.cpu)
+    # Webcam: open it once and keep it open between clips (faster, and nothing can grab it meanwhile).
+    camera = FrameSource(args.camera, None, mirror=False) if args.record > 0 and region is None else None
     repeat = args.auto or args.loop
-    entries, n = [], 0
+    entries, n, failures = [], 0, 0
     try:
         while True:
             n += 1
-            if args.record > 0:
-                clip = record_clip(args.clip, args.record, args.camera, region=region, feed=feed)
-            else:
-                clip = Path(args.clip)
-            feed.set_status("Reading lips")
-            text = model.transcribe(clip)
-            if args.record > 0 and not args.keep_clips:
-                Path(clip).unlink(missing_ok=True)            # privacy: no video is kept
+            try:
+                if args.record > 0:
+                    if follow_face and n > 1:
+                        region = wait_for_face_on_screen(args.monitor, feed)
+                    clip = record_clip(args.clip, args.record, args.camera, region=region, feed=feed,
+                                       source=camera, countdown=3 if n == 1 else 1.5)
+                else:
+                    clip = Path(args.clip)
+                feed.set_status("Reading lips")
+                if model.proc.poll() is not None:            # the model process died: restart it
+                    feed.set_status("Restarting model")
+                    model = VSRModel(args.repo, args.config, args.python, args.cpu)
+                text = model.transcribe(clip)
+                failures = 0
+            except (Exception, SystemExit) as e:             # one bad clip must not end the demo
+                failures += 1
+                print(f"Problem with this clip: {e}")
+                feed.set_status("Hiccup, trying again")
+                if failures >= 3 or not (repeat and args.record > 0):
+                    print("Stopping after repeated problems. Paste the messages above if you need help.")
+                    break
+                time.sleep(1)
+                continue
+            finally:
+                if args.record > 0 and not args.keep_clips:
+                    Path(args.clip).unlink(missing_ok=True)  # privacy: no video is kept
             label = f"{datetime.now():%H:%M:%S}"
             print(f"\n>>> {text or '(nothing recognised)'}\n")
-            feed.add_entry(label, text)
-            feed.set_status("Ready")
+            if text:
+                feed.add_entry(label, text)
+            feed.set_status("Ready" if text else "Didn't catch that, try again")
             entries.append({"time": f"Clip {n} · {label}", "text": text})
             with open(args.transcript, "a", encoding="utf-8") as f:
                 f.write(text + "\n")
             if args.pdf:
-                write_transcript_pdf(Path(args.pdf), "LipLine transcript (Auto-AVSR)", entries,
-                                     "Visual-only speech recognition. Expect some wrong words.")
+                try:
+                    write_transcript_pdf(Path(args.pdf), "LipLine transcript (Auto-AVSR)", entries,
+                                         "Visual-only speech recognition. Expect some wrong words.")
+                except Exception as e:                       # e.g. the PDF is open in a viewer
+                    print(f"PDF not updated ({e}); the text transcript is still saved.")
             if not (repeat and args.record > 0):
                 break
             if not args.auto and input("Press Enter to record another clip, "
@@ -1115,6 +1215,8 @@ def run_transcribe(args) -> None:
         print("\nStopped.")
     finally:
         feed.set_status("Stopped")
+        if camera is not None:
+            camera.release()
         model.close()
     if args.captions:
         try:
@@ -1127,8 +1229,9 @@ def run_transcribe(args) -> None:
 # Command line
 # =============================================================================
 def add_capture_options(p) -> None:
-    p.add_argument("--screen", action="store_true", help="read a video tile on screen (Meet/Zoom) instead of the webcam")
-    p.add_argument("--pick-region", action="store_true", help="choose the screen region again")
+    p.add_argument("--screen", action="store_true",
+                   help="read the largest face on screen (e.g. the pinned speaker in Meet) instead of the webcam")
+    p.add_argument("--pick-region", action="store_true", help="with --screen: drag a box by hand instead")
     p.add_argument("--monitor", type=int, default=1, help="which monitor to capture with --screen")
     p.add_argument("--no-captions", dest="captions", action="store_false", help="don't start the caption page")
     p.add_argument("--no-browser", action="store_true", help="start the caption page without opening a browser")
