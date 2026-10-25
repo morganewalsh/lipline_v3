@@ -635,17 +635,35 @@ def start_caption_page(feed: CaptionFeed, port: int, open_browser: bool = True) 
 # =============================================================================
 # Step 4d · Frame sources: webcam, or a region of the screen (a Meet / Zoom video tile)
 # =============================================================================
-def pick_screen_region(monitor: int = 1) -> dict:
-    """Show a screenshot and let you drag a box around the speaker's video tile."""
+def open_mss():
+    """mss.MSS in newer versions of mss, mss.mss in older ones."""
     import mss
+    return mss.MSS() if hasattr(mss, "MSS") else mss.mss()
 
-    with mss.mss() as sct:
+
+def pick_screen_region(monitor: int = 1, wait_s: int = 5) -> dict:
+    """Take a screenshot (after a countdown, so you can bring the Meet window to the front)
+    and let you drag a box around the speaker's video tile."""
+    print("Bring the Meet window to the front so the speaker's video is visible.")
+    for i in range(wait_s, 0, -1):
+        print(f"  Taking a screenshot in {i}…", flush=True)
+        time.sleep(1)
+    with open_mss() as sct:
         mon = sct.monitors[monitor]
         shot = np.ascontiguousarray(np.array(sct.grab(mon))[:, :, :3])
     scale = min(1.0, 1280 / shot.shape[1])
     view = cv2.resize(shot, None, fx=scale, fy=scale) if scale < 1 else shot.copy()
-    put(view, "Drag a box around the speaker's face/video, then press ENTER", (10, 30), 0.7, (90, 214, 255), 2)
-    x, y, w, h = cv2.selectROI("LipLine - select the speaker", view, showCrosshair=False)
+    cv2.rectangle(view, (0, 0), (view.shape[1], 44), (128, 1, 0), -1)        # navy instruction bar
+    put(view, "Drag a box around the speaker's face, then press ENTER (c = cancel)", (12, 30), 0.75,
+        (254, 160, 231), 2)
+    name = "LipLine - select the speaker"
+    cv2.namedWindow(name, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(name, view.shape[1], view.shape[0])
+    try:
+        cv2.setWindowProperty(name, cv2.WND_PROP_TOPMOST, 1)                   # keep it in front
+    except cv2.error:
+        pass
+    x, y, w, h = cv2.selectROI(name, view, showCrosshair=False)
     cv2.destroyAllWindows()
     if w < 20 or h < 20:
         sys.exit("No region selected.")
@@ -671,8 +689,7 @@ class FrameSource:
     def __init__(self, camera: int, region: dict | None, mirror: bool = True) -> None:
         self.region, self.cap, self.sct, self.mirror = region, None, None, mirror
         if region:
-            import mss
-            self.sct = mss.mss()
+            self.sct = open_mss()
             self._next = 0.0
         else:
             self.cap = open_camera(camera)
